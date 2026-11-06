@@ -466,7 +466,15 @@ def get_api_key() -> str:
 
 @st.cache_resource(show_spinner=False)
 def make_client(key: str):
-    return genai.Client(api_key=key, http_options=types.HttpOptions(timeout=90_000))
+    # Force v1beta — speechConfig / TTS is still only available on the beta endpoint.
+    # The SDK now defaults to stable v1, which rejects "speechConfig".
+    return genai.Client(
+        api_key=key,
+        http_options=types.HttpOptions(
+            timeout=90_000,
+            api_version="v1beta",
+        ),
+    )
 
 
 class AppError(Exception):
