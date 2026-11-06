@@ -1,14 +1,33 @@
 """
 Abdur AI Assistant - an AI voice assistant built with Streamlit + Google Gemini.
 
-Flow (voice): microphone -> Gemini understands the speech and answers ->
-Gemini TTS generates a real WAV voice note -> auto-played + written transcript.
+Two voice engines (choose in the sidebar -> Quick settings):
 
-Secrets: set GEMINI_API_KEY in Streamlit Secrets or as an environment variable.
+1. Live voice-to-voice (default): your recording is sent straight to
+   `gemini-3.8-live`, which listens and answers with its own voice in ONE call.
+   Free tier available with a free Google AI Studio key.
+
+2. Classic: Gemini understands the audio and writes the answer
+   (`gemini-3.5-flash-lite`), then Gemini TTS (`gemini-3.8-flash-tts`) speaks it.
+
+If Live fails for any reason, the app automatically falls back to Classic.
+
+Setup
+-----
+    pip install -U streamlit google-genai
+    export GEMINI_API_KEY="your-free-key"      # or put it in .streamlit/secrets.toml
+    streamlit run app.py
+
+Model names can be changed WITHOUT editing code. Set any of these in Streamlit
+Secrets or as environment variables (comma separated lists are tried in order):
+
+    TEXT_MODELS = "gemini-3.5-flash-lite,gemini-3.8-flash"
+    TTS_MODELS  = "gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts"
+    LIVE_MODEL  = "gemini-3.8-live"
 """
 
+import asyncio
 import base64
-import hashlib
 import html
 import io
 import json
@@ -27,7 +46,7 @@ from google import genai
 from google.genai import types
 
 # --------------------------------------------------------------------------- #
-# Page config
+# Page config (must be the first Streamlit command)
 # --------------------------------------------------------------------------- #
 st.set_page_config(
     page_title="Abdur AI Assistant",
@@ -36,19 +55,41 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+
+# --------------------------------------------------------------------------- #
+# Configuration helpers
+# --------------------------------------------------------------------------- #
+def cfg_value(name: str, default: str = "") -> str:
+    """Read a setting from Streamlit Secrets, then environment, then default."""
+    try:
+        v = st.secrets.get(name, "")
+        if v:
+            return str(v).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return os.environ.get(name, "").strip() or default
+
+
+def cfg_list(name: str, default: str) -> list:
+    return [x.strip() for x in cfg_value(name, default).split(",") if x.strip()]
+
+
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
 APP_NAME = "Abdur AI Assistant"
 
-# Text / audio-understanding models (tried in order).
-TEXT_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-# Text-to-speech models (tried in order).
-TTS_MODELS = [
-    "gemini-2.5-flash-preview-tts",
-    "gemini-3.1-flash-tts-preview",
-    "gemini-2.5-pro-preview-tts",
-]
+# Text / audio-understanding models (tried in order). All have a free tier.
+TEXT_MODELS = cfg_list("TEXT_MODELS", "gemini-3.5-flash-lite,gemini-3.8-flash,gemini-3.6-flash")
+# Text-to-speech models (tried in order). The old 2.5 / 3.1 preview TTS models
+# are retired on 17 Nov 2026, so only the 3.8 models are listed.
+TTS_MODELS = cfg_list("TTS_MODELS", "gemini-3.8-flash-tts,gemini-3.8-flash-lite-tts")
+# Live (audio-in -> audio-out) model.
+LIVE_MODEL = cfg_value("LIVE_MODEL", "gemini-3.8-live")
+
+ENGINE_LIVE = "Live voice-to-voice (recommended)"
+ENGINE_CLASSIC = "Classic (understand + speak)"
+ENGINES = [ENGINE_LIVE, ENGINE_CLASSIC]
 
 VOICES = [
     "Kore", "Puck", "Zephyr", "Aoede", "Charon", "Fenrir",
@@ -61,9 +102,12 @@ STYLES = {
     "Concise": "extremely concise and direct",
 }
 
-MAX_TTS_CHARS = 2500   # characters spoken per answer (full text is always shown)
-TTS_CHUNK_CHARS = 800  # each TTS request handles at most this many characters
+MAX_TTS_CHARS = 2500    # characters spoken per answer (full text is always shown)
+TTS_CHUNK_CHARS = 800   # each TTS request handles at most this many characters
 MAX_HISTORY_MESSAGES = 24
+LIVE_TIMEOUT_SEC = 70   # max time for one Live voice turn
+LIVE_IN_RATE = 16000    # Live API input: 16-bit PCM, 16 kHz, mono
+LIVE_OUT_RATE = 24000   # Live API output: 16-bit PCM, 24 kHz, mono
 
 URDU_RE = re.compile(r"[\u0600-\u06FF]")
 
@@ -114,7 +158,7 @@ section[data-testid="stSidebar"] *{ color:var(--white); }
 .brand .sub{ color:var(--muted); font-size:.74rem; }
 
 .chip{ display:inline-block; padding:.22rem .7rem; border-radius:999px; font-size:.76rem;
-  border:1px solid rgba(168,85,247,.35); background:rgba(147,51,234,.12); }
+  border:1px solid rgba(168,85,247,.35); background:rgba(147,51,234,.12); margin-right:.3rem; }
 .chip.ok{ border-color:rgba(34,211,238,.5); background:rgba(34,211,238,.10); color:#a5f3fc; }
 .chip.bad{ border-color:rgba(248,113,113,.5); background:rgba(248,113,113,.10); color:#fecaca; }
 
@@ -147,13 +191,8 @@ h1,h2,h3{ color:var(--white) !important; letter-spacing:-.01em; }
 @keyframes ripple{ 0%{ transform:scale(.95); opacity:.8;} 100%{ transform:scale(1.5); opacity:0;} }
 @keyframes spin{ to{ transform:rotate(360deg);} }
 
-/* Native audio recorder styled like a mic control */
-div[data-testid="stAudioInput"]{ max-width:420px; margin:0 auto; }
-div[data-testid="stAudioInput"] > div{ border-radius:999px;
-  background:rgba(147,51,234,.14); border:1px solid rgba(168,85,247,.5);
-  box-shadow:0 0 26px rgba(147,51,234,.35); }
-div[data-testid="stAudioInput"] label{ display:none; }
 .mic-hint{ text-align:center; color:var(--muted); font-size:.85rem; margin:.4rem 0 1.2rem 0; }
+.engine-row{ text-align:center; margin:.2rem 0 .4rem 0; }
 
 /* Messages */
 .msg{ border-radius:16px; padding:.85rem 1.05rem; margin:.65rem 0 .25rem 0;
@@ -259,7 +298,6 @@ def stop_all_audio() -> None:
         "catch(e){}});}catch(e){}</script>",
         height=0,
     )
-
 
 
 # --------------------------------------------------------------------------- #
@@ -379,6 +417,7 @@ def get_recorder():
     (folder / "index.html").write_text(RECORDER_HTML, encoding="utf-8")
     return components.declare_component("abdur_voice_recorder", path=str(folder))
 
+
 # --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
@@ -402,7 +441,9 @@ def init_state() -> None:
     ss.setdefault("flash", None)
     ss.setdefault("api_status", "unknown")
     ss.setdefault("user_key", "")
-    ss.setdefault("stats", {"requests": 0, "voices": 0, "audio_sec": 0.0, "errors": 0})
+    ss.setdefault("engine", ENGINE_LIVE)
+    ss.setdefault("stats", {"requests": 0, "voices": 0, "audio_sec": 0.0, "errors": 0, "fallbacks": 0})
+    ss.stats.setdefault("fallbacks", 0)
     if "current" not in ss or ss.current not in ss.conversations:
         if ss.conversations:
             ss.current = list(ss.conversations)[-1]
@@ -420,13 +461,7 @@ def current_conv() -> dict:
 def get_api_key() -> str:
     if st.session_state.get("user_key"):
         return st.session_state.user_key.strip()
-    try:
-        key = st.secrets.get("GEMINI_API_KEY", "")
-        if key:
-            return str(key).strip()
-    except Exception:
-        pass
-    return os.environ.get("GEMINI_API_KEY", "").strip()
+    return cfg_value("GEMINI_API_KEY", "")
 
 
 @st.cache_resource(show_spinner=False)
@@ -443,12 +478,17 @@ def friendly_error(e: Exception) -> str:
     low = msg.lower()
     if isinstance(e, AppError):
         return msg
+    if isinstance(e, asyncio.TimeoutError):
+        return "The live voice model took too long to answer."
     if "api_key_invalid" in low or "api key not valid" in low or "invalid api key" in low:
         return "Your Gemini API key is invalid. Check GEMINI_API_KEY and try again."
     if "permission_denied" in low or "403" in low:
         return "Gemini refused the request (403). The key may lack access to this model or region."
     if "429" in low or "resource_exhausted" in low or "quota" in low:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
+    if "404" in low or "no longer available" in low or "not found" in low:
+        return ("A configured Gemini model is retired or unavailable (404). Update TEXT_MODELS, TTS_MODELS "
+                "or LIVE_MODEL (see Settings & Help -> Check model names).")
     if any(x in low for x in ("timed out", "timeout", "connection", "getaddrinfo", "network", "unreachable")):
         return "Network problem while contacting Gemini. Check your connection and try again."
     if "503" in low or "unavailable" in low or "overloaded" in low or "500" in low:
@@ -459,14 +499,17 @@ def friendly_error(e: Exception) -> str:
 
 
 def is_transient(e: Exception) -> bool:
+    if isinstance(e, asyncio.TimeoutError):
+        return True
     low = str(e).lower()
     return any(x in low for x in ("503", "500", "unavailable", "overloaded", "timed out", "timeout",
-                                  "connection", "reset", "network"))
+                                  "connection", "reset", "network", "1011", "1006"))
 
 
 def is_model_missing(e: Exception) -> bool:
     low = str(e).lower()
-    return "404" in low or "not found" in low or "not supported" in low or "is not found" in low
+    return ("404" in low or "not found" in low or "no longer available" in low
+            or "not supported" in low or "is not found" in low)
 
 
 def call_models(models, fn, tries: int = 3):
@@ -489,24 +532,43 @@ def call_models(models, fn, tries: int = 3):
     raise last if last else AppError("No model available.")
 
 
-def build_system(voice: bool) -> str:
+def lang_and_style_rules() -> list:
     lang = st.session_state.get("lang", "Auto-detect")
     style = STYLES.get(st.session_state.get("style", "Friendly"), STYLES["Friendly"])
     if lang == "Auto-detect":
         lang_rule = ("Reply in the same language the user speaks or writes (English or Urdu). "
-                     "If the user speaks Roman Urdu, reply in Urdu script.")
+                     "If the user speaks Roman Urdu, reply in Urdu.")
     else:
         lang_rule = f"Always reply in {lang}, whatever language the user uses."
-    rules = [
+    return [
         f"You are {APP_NAME}, a {style} AI assistant that talks with people like a real person.",
         lang_rule,
-        "When replying in Urdu, use proper Urdu script (Arabic-based, اردو) ONLY. "
-        "Never use Devanagari/Hindi script and never use Roman Urdu in your reply.",
-        "Write plain text only: no markdown, no asterisks, no bullet symbols, no emojis, "
-        "because your reply will be read aloud.",
-        "Use the earlier conversation for context.",
     ]
-    if voice:
+
+
+def history_text(conv: dict, n: int = 8) -> str:
+    """Short plain-text recap of the last messages (used as context for Live)."""
+    lines = []
+    for m in conv["messages"][-n:]:
+        t = m["text"].strip()
+        if t:
+            who = "User" if m["role"] == "user" else "Assistant"
+            lines.append(f"{who}: {t[:500]}")
+    return "\n".join(lines)
+
+
+def build_system(mode: str, conv: dict = None) -> str:
+    """mode: 'text' | 'classic_voice' | 'live'"""
+    rules = lang_and_style_rules()
+    if mode in ("text", "classic_voice"):
+        rules += [
+            "When replying in Urdu, use proper Urdu script (Arabic-based, اردو) ONLY. "
+            "Never use Devanagari/Hindi script and never use Roman Urdu in your reply.",
+            "Write plain text only: no markdown, no asterisks, no bullet symbols, no emojis, "
+            "because your reply will be read aloud.",
+            "Use the earlier conversation for context.",
+        ]
+    if mode == "classic_voice":
         rules.append("Keep replies natural and spoken-style, usually 1 to 4 sentences unless the user asks for detail.")
         rules.append(
             "The user's latest message is an audio recording. Transcribe exactly what they said in the "
@@ -514,6 +576,17 @@ def build_system(voice: bool) -> str:
             "return an empty transcript and a short reply asking them to try again."
         )
         rules.append('Return JSON: {"transcript": ..., "reply": ..., "language": "English" or "Urdu"}.')
+    elif mode == "live":
+        rules += [
+            "You are in a spoken voice conversation. Answer out loud, naturally, usually in 1 to 4 sentences "
+            "unless the user asks for detail.",
+            "Speak plain natural language: never read out symbols, markdown, URLs or emojis.",
+            "If you reply in Urdu, speak proper Urdu.",
+            "If the audio is silent or unintelligible, politely ask the user to try again.",
+        ]
+        recap = history_text(conv) if conv else ""
+        if recap:
+            rules.append("Earlier conversation (context only, do not repeat it):\n" + recap)
     else:
         rules.append("Give helpful, accurate answers. Be thorough when needed but avoid padding.")
     return "\n".join(rules)
@@ -530,8 +603,9 @@ def history_contents(conv: dict) -> list:
 
 
 def gen_config(system: str, json_out: bool = False) -> types.GenerateContentConfig:
-    kwargs = dict(system_instruction=system, temperature=0.7,
-                  thinking_config=types.ThinkingConfig(thinking_budget=0))
+    # No thinking_config on purpose: the Gemini 3.x models use a different
+    # thinking control than 2.5 and default to fast, low-latency behaviour.
+    kwargs = dict(system_instruction=system, temperature=0.7)
     if json_out:
         kwargs.update(response_mime_type="application/json", response_schema=RESPONSE_SCHEMA)
     return types.GenerateContentConfig(**kwargs)
@@ -541,28 +615,29 @@ def parse_json(text: str) -> dict:
     text = (text or "").strip()
     try:
         return json.loads(text)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
     text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
     try:
         return json.loads(text)
-    except Exception:
+    except Exception:  # noqa: BLE001
         m = re.search(r"\{.*\}", text, flags=re.S)
         if m:
             try:
                 return json.loads(m.group(0))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
     raise AppError("Gemini returned an unreadable answer. Please try again.")
 
 
+# ---- Classic pipeline: understand audio -> text answer --------------------- #
 def voice_turn(client, audio: bytes, mime: str, conv: dict) -> dict:
     contents = history_contents(conv)
     contents.append(types.Content(role="user", parts=[
         types.Part.from_bytes(data=audio, mime_type=mime),
         types.Part.from_text(text="Transcribe my voice message and reply."),
     ]))
-    cfg = gen_config(build_system(voice=True), json_out=True)
+    cfg = gen_config(build_system("classic_voice"), json_out=True)
     resp = call_models(TEXT_MODELS, lambda m: client.models.generate_content(model=m, contents=contents, config=cfg))
     data = parse_json(resp.text)
     return {
@@ -574,7 +649,7 @@ def voice_turn(client, audio: bytes, mime: str, conv: dict) -> dict:
 def text_turn(client, conv: dict, user_text: str) -> str:
     contents = history_contents(conv)
     contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
-    cfg = gen_config(build_system(voice=False))
+    cfg = gen_config(build_system("text"))
     resp = call_models(TEXT_MODELS, lambda m: client.models.generate_content(model=m, contents=contents, config=cfg))
     out = (resp.text or "").strip()
     if not out:
@@ -582,7 +657,7 @@ def text_turn(client, conv: dict, user_text: str) -> str:
     return out
 
 
-# ---- Speech generation ----------------------------------------------------- #
+# ---- Speech generation (TTS) ------------------------------------------------ #
 def clean_for_speech(text: str) -> str:
     text = re.sub(r"https?://\S+", "", text)
     text = re.sub(r"[*_#`>~]+", "", text)
@@ -618,22 +693,31 @@ def pcm_to_wav(pcm: bytes, rate: int = 24000) -> bytes:
     return buf.getvalue()
 
 
+def wav_to_pcm(wav_bytes: bytes) -> bytes:
+    with wave.open(io.BytesIO(wav_bytes), "rb") as w:
+        return w.readframes(w.getnframes())
+
+
+def voice_config(voice: str) -> types.SpeechConfig:
+    return types.SpeechConfig(
+        voice_config=types.VoiceConfig(
+            prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
+        )
+    )
+
+
 def synth_chunk(client, model: str, text: str, voice: str):
     prompt = f"Say in a warm, natural, conversational tone:\n{text}"
     cfg = types.GenerateContentConfig(
         response_modalities=["AUDIO"],
-        speech_config=types.SpeechConfig(
-            voice_config=types.VoiceConfig(
-                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice)
-            )
-        ),
+        speech_config=voice_config(voice),
     )
     resp = client.models.generate_content(model=model, contents=prompt, config=cfg)
     try:
         part = resp.candidates[0].content.parts[0]
         data = part.inline_data.data
         mime = part.inline_data.mime_type or ""
-    except Exception:
+    except Exception:  # noqa: BLE001
         raise AppError("The speech model returned no audio.")
     if not data:
         raise AppError("The speech model returned empty audio.")
@@ -653,6 +737,95 @@ def generate_speech(client, text: str):
         pcm_all += data
     wav = pcm_to_wav(pcm_all, rate)
     return wav, len(pcm_all) / (2 * rate)
+
+
+# ---- Live voice-to-voice (audio in -> audio out in one call) --------------- #
+async def _live_once(client, pcm: bytes, system: str, voice: str):
+    config = types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        system_instruction=system,
+        speech_config=voice_config(voice),
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+    )
+    # Trailing silence helps the server detect that the speaker has finished.
+    silence = b"\x00\x00" * int(LIVE_IN_RATE * 0.8)
+    payload = pcm + silence
+    step = LIVE_IN_RATE * 2 // 2  # 0.5 second chunks (16-bit mono)
+    audio, user_parts, ai_parts = bytearray(), [], []
+
+    async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+        for i in range(0, len(payload), step):
+            await session.send_realtime_input(
+                audio=types.Blob(data=payload[i:i + step], mime_type=f"audio/pcm;rate={LIVE_IN_RATE}")
+            )
+        await session.send_realtime_input(audio_stream_end=True)
+
+        async for msg in session.receive():
+            sc = getattr(msg, "server_content", None)
+            if not sc:
+                continue
+            if getattr(sc, "model_turn", None) and sc.model_turn.parts:
+                for part in sc.model_turn.parts:
+                    inline = getattr(part, "inline_data", None)
+                    if inline and inline.data:
+                        audio.extend(inline.data)
+            it = getattr(sc, "input_transcription", None)
+            if it and getattr(it, "text", None):
+                user_parts.append(it.text)
+            ot = getattr(sc, "output_transcription", None)
+            if ot and getattr(ot, "text", None):
+                ai_parts.append(ot.text)
+            if getattr(sc, "turn_complete", False):
+                break
+
+    return bytes(audio), "".join(user_parts).strip(), "".join(ai_parts).strip()
+
+
+def live_voice_turn(client, wav: bytes, conv: dict):
+    """Returns (reply_wav, user_text, ai_text, duration_seconds)."""
+    pcm = wav_to_pcm(wav)
+    system = build_system("live", conv)
+    voice = st.session_state.get("voice", "Kore")
+    last = None
+    for attempt in range(2):
+        try:
+            audio, user_text, ai_text = asyncio.run(
+                asyncio.wait_for(_live_once(client, pcm, system, voice), timeout=LIVE_TIMEOUT_SEC)
+            )
+            if not audio:
+                raise AppError("The live model returned no audio.")
+            dur = len(audio) / (2 * LIVE_OUT_RATE)
+            return (pcm_to_wav(audio, LIVE_OUT_RATE),
+                    user_text or "🎙️ (voice message)",
+                    ai_text or "🔊 (voice reply)",
+                    dur)
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if is_transient(e) and attempt == 0:
+                time.sleep(1.2)
+                continue
+            raise
+    raise last if last else AppError("Live voice failed.")
+
+
+def run_voice_turn(client, data: bytes, conv: dict, orb_ph) -> dict:
+    """Run one voice turn with the chosen engine; falls back to Classic."""
+    note = ""
+    if st.session_state.get("engine", ENGINE_LIVE) == ENGINE_LIVE:
+        orb_ph.markdown(orb("thinking", "Listening and thinking…"), unsafe_allow_html=True)
+        try:
+            wav, user_text, ai_text, dur = live_voice_turn(client, data, conv)
+            return {"transcript": user_text, "reply": ai_text, "wav": wav, "duration": dur, "note": ""}
+        except Exception as e:  # noqa: BLE001
+            st.session_state.stats["errors"] += 1
+            st.session_state.stats["fallbacks"] += 1
+            note = f"Live voice mode failed ({friendly_error(e)}) so I switched to classic mode for this answer."
+
+    orb_ph.markdown(orb("thinking", "Listening to your words…"), unsafe_allow_html=True)
+    result = voice_turn(client, data, "audio/wav", conv)
+    return {"transcript": result["transcript"], "reply": result["reply"],
+            "wav": None, "duration": 0.0, "note": note}
 
 
 # --------------------------------------------------------------------------- #
@@ -681,7 +854,7 @@ def add_message(conv: dict, role: str, text: str, audio=None, duration: float = 
 
 
 def attach_speech(client, conv: dict, msg: dict) -> str:
-    """Generate speech for a message. Returns '' or an error string."""
+    """Generate speech for a message with the TTS models. Returns '' or an error string."""
     try:
         wav, dur = generate_speech(client, msg["text"])
         msg["audio"], msg["duration"] = wav, dur
@@ -698,7 +871,7 @@ def render_messages(conv: dict, client) -> None:
     autoplay_id = st.session_state.autoplay_id
     for m in conv["messages"]:
         st.markdown(msg_html(m["role"], m["text"]), unsafe_allow_html=True)
-        if m["role"] != "ai" and m["role"] != "assistant":
+        if m["role"] not in ("ai", "assistant"):
             continue
         if m.get("audio"):
             render_player(m["audio"], m["id"], autoplay=(m["id"] == autoplay_id))
@@ -724,7 +897,8 @@ def api_card() -> None:
     st.markdown(
         '<div class="card"><h4>🔑 Gemini API key needed</h4>'
         "Add <b>GEMINI_API_KEY</b> in Streamlit Secrets (or as an environment variable) and reload. "
-        "You can also paste a key below for this browser session only - it is never saved.</div>",
+        "You can get a free key at Google AI Studio. You can also paste a key below for this browser "
+        "session only - it is never saved.</div>",
         unsafe_allow_html=True,
     )
     k = st.text_input("Gemini API key", type="password", key="key_input", placeholder="AIza…")
@@ -737,9 +911,9 @@ def api_card() -> None:
 def welcome_card() -> None:
     st.markdown(
         '<div class="card"><h4>👋 Welcome - how to talk to me</h4><ol>'
-        "<li>Tap the microphone and allow microphone access when your browser asks.</li>"
-        "<li>Speak naturally in English or Urdu, then tap the button again to stop.</li>"
-        "<li>I will understand you, answer, and speak the answer back automatically.</li>"
+        "<li>Press <b>Start recording</b> and allow microphone access when your browser asks.</li>"
+        "<li>Speak naturally in English or Urdu, then press <b>Stop &amp; send</b>.</li>"
+        "<li>I listen and answer with my own voice, automatically.</li>"
         "<li>Use the player to replay, stop, or download the voice note.</li></ol></div>",
         unsafe_allow_html=True,
     )
@@ -759,10 +933,14 @@ def page_voice(client) -> None:
         api_card()
         return
 
+    live_on = st.session_state.get("engine", ENGINE_LIVE) == ENGINE_LIVE
     speaking = st.session_state.autoplay_id is not None
     orb_ph = st.empty()
     orb_ph.markdown(orb("speaking", "Speaking…") if speaking else orb("idle", "Press Start recording and talk"),
                     unsafe_allow_html=True)
+    st.markdown(f'<div class="engine-row"><span class="chip ok">{"⚡ Live voice-to-voice" if live_on else "🔁 Classic mode"}'
+                f' · {html.escape(LIVE_MODEL if live_on else TEXT_MODELS[0])}</span></div>',
+                unsafe_allow_html=True)
 
     recorder = get_recorder()
     rec_value = recorder(key="voice_rec", default=None)
@@ -781,24 +959,34 @@ def page_voice(client) -> None:
         st.session_state.last_rec_id = rec_value["id"]
         try:
             data = base64.b64decode(rec_value.get("b64", ""))
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = b""
         if len(data) < 3000:
             st.session_state.flash = ("warning", "I did not hear anything. Please record again and speak for a moment.")
             st.rerun()
-        orb_ph.markdown(orb("thinking", "Listening to your words…"), unsafe_allow_html=True)
         try:
             st.session_state.stats["requests"] += 1
-            result = voice_turn(client, data, "audio/wav", conv)
+            result = run_voice_turn(client, data, conv, orb_ph)
             if not result["transcript"]:
                 st.session_state.flash = ("warning", "I could not understand the recording. Please try again, a little closer to the microphone.")
                 st.rerun()
+
             add_message(conv, "user", result["transcript"])
-            ai_msg = add_message(conv, "ai", result["reply"] or "Sorry, I could not think of an answer.")
-            orb_ph.markdown(orb("thinking", "Creating my voice…"), unsafe_allow_html=True)
-            err = attach_speech(client, conv, ai_msg)
-            if err:
-                st.session_state.flash = ("error", f"I answered in text, but voice generation failed: {err}")
+            reply_text = result["reply"] or "Sorry, I could not think of an answer."
+            ai_msg = add_message(conv, "ai", reply_text, audio=result["wav"], duration=result["duration"])
+
+            if result["wav"]:  # Live engine already produced the voice
+                st.session_state.stats["voices"] += 1
+                st.session_state.stats["audio_sec"] += result["duration"]
+                st.session_state.autoplay_id = ai_msg["id"]
+            else:              # Classic engine: speak the text answer with TTS
+                orb_ph.markdown(orb("thinking", "Creating my voice…"), unsafe_allow_html=True)
+                err = attach_speech(client, conv, ai_msg)
+                if err:
+                    st.session_state.flash = ("error", f"I answered in text, but voice generation failed: {err}")
+
+            if result["note"] and not st.session_state.flash:
+                st.session_state.flash = ("warning", result["note"])
         except Exception as e:  # noqa: BLE001
             if type(e).__name__ in ("RerunException", "StopException"):
                 raise
@@ -864,6 +1052,14 @@ def page_notes(client) -> None:
         render_player(m["audio"], m["id"], autoplay=False)
 
 
+def available_model_ids(client) -> set:
+    names = set()
+    for m in client.models.list():
+        n = getattr(m, "name", "") or ""
+        names.add(n.replace("models/", ""))
+    return names
+
+
 def page_settings(client) -> None:
     st.markdown('<div class="page-title">Settings & Help</div>'
                 '<div class="page-sub">Connection, usage and conversation management.</div>', unsafe_allow_html=True)
@@ -875,30 +1071,52 @@ def page_settings(client) -> None:
         st.error("No API key found.")
         api_card()
     else:
-        col1, col2 = st.columns([1, 2])
-        if col1.button("🔌 Test connection"):
+        col1, col2, col3 = st.columns([1, 1, 1])
+        if col1.button("🔌 Test text model"):
             try:
                 with st.spinner("Contacting Gemini…"):
                     call_models(TEXT_MODELS, lambda m: client.models.generate_content(
                         model=m, contents="Reply with the single word OK."))
                 st.session_state.api_status = "ok"
+                st.success("Text model works.")
             except Exception as e:  # noqa: BLE001
                 st.session_state.api_status = "error"
                 st.error(friendly_error(e))
+        if col2.button("🔊 Test speech (TTS)"):
+            try:
+                with st.spinner("Generating a short voice sample…"):
+                    wav, dur = generate_speech(client, "Hello! This is a test of my voice.")
+                st.success(f"Speech works ({dur:.1f}s).")
+                render_player(wav, "test", autoplay=False)
+            except Exception as e:  # noqa: BLE001
+                st.error(friendly_error(e))
+        if col3.button("🧾 Check model names"):
+            try:
+                with st.spinner("Asking Gemini which models exist…"):
+                    ids = available_model_ids(client)
+                rows = [("Text", m) for m in TEXT_MODELS] + [("Speech", m) for m in TTS_MODELS] + [("Live", LIVE_MODEL)]
+                for kind, m in rows:
+                    st.write(f'{"✅" if m in ids else "❌"} **{kind}**: `{m}`'
+                             + ("" if m in ids else " - not listed for your key (may still work, or update the name)"))
+            except Exception as e:  # noqa: BLE001
+                st.error(friendly_error(e))
+
         status = st.session_state.api_status
-        col2.markdown({"ok": '<span class="chip ok">● Connected</span>',
-                       "error": '<span class="chip bad">● Connection problem</span>'}.get(
-                           status, '<span class="chip">● Key found - not tested yet</span>'),
-                      unsafe_allow_html=True)
-        st.caption(f"Text model: {TEXT_MODELS[0]} · Speech models: {', '.join(TTS_MODELS)}")
+        st.markdown({"ok": '<span class="chip ok">● Connected</span>',
+                     "error": '<span class="chip bad">● Connection problem</span>'}.get(
+                         status, '<span class="chip">● Key found - not tested yet</span>'),
+                    unsafe_allow_html=True)
+        st.caption(f"Live model: {LIVE_MODEL} · Text models: {', '.join(TEXT_MODELS)} · "
+                   f"Speech models: {', '.join(TTS_MODELS)}")
 
     st.markdown("### Usage (this session)")
     s = st.session_state.stats
-    a, b, c, d = st.columns(4)
+    a, b, c, d, e = st.columns(5)
     a.metric("AI requests", s["requests"])
     b.metric("Voice notes", s["voices"])
     c.metric("Audio generated", f'{s["audio_sec"]:.0f}s')
     d.metric("Errors", s["errors"])
+    e.metric("Live fallbacks", s.get("fallbacks", 0))
 
     st.markdown("### Conversations")
     total = sum(len(c["messages"]) for c in st.session_state.conversations.values())
@@ -919,8 +1137,13 @@ def page_settings(client) -> None:
         '<div class="card"><ul>'
         "<li><b>Microphone blocked?</b> Click the lock icon in the address bar and allow the microphone, then reload.</li>"
         "<li><b>No sound?</b> Check device volume. If autoplay is blocked, press ▶ on the voice note.</li>"
-        "<li><b>Urdu:</b> speak Urdu or choose Urdu in Quick settings - answers appear in Urdu script.</li>"
-        "<li><b>Privacy:</b> your API key stays on the server and is never sent to the browser.</li></ul></div>",
+        "<li><b>Urdu:</b> speak Urdu or choose Urdu in Quick settings - Classic mode shows answers in Urdu script.</li>"
+        "<li><b>Rate limit (429)?</b> The free tier has per-project limits. Wait a minute, or switch the voice "
+        "engine to Classic in Quick settings.</li>"
+        "<li><b>404 / model retired?</b> Press <i>Check model names</i> above, then set TEXT_MODELS, TTS_MODELS "
+        "or LIVE_MODEL in Streamlit Secrets.</li>"
+        "<li><b>Privacy:</b> your API key stays on the server and is never sent to the browser. On Google's free "
+        "tier, content you send may be used to improve Google products, so avoid private audio.</li></ul></div>",
         unsafe_allow_html=True,
     )
 
@@ -938,6 +1161,9 @@ def sidebar(has_key: bool) -> None:
                     else '<span class="chip bad">● API key missing</span>', unsafe_allow_html=True)
 
         with st.expander("🎚️ Quick settings", expanded=False):
+            st.radio("Voice engine", ENGINES, key="engine",
+                     help="Live = one model listens and speaks (fastest). "
+                          "Classic = understand the audio, then read the answer with text-to-speech.")
             st.selectbox("Response language", LANGUAGES, key="lang")
             st.selectbox("Voice", VOICES, key="voice")
             st.select_slider("Speaking speed", options=[0.75, 0.9, 1.0, 1.15, 1.3, 1.5], value=1.0, key="voice_speed")
