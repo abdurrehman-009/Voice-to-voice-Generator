@@ -14,10 +14,12 @@ import io
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
 import wave
 from datetime import datetime
+from pathlib import Path
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -259,6 +261,124 @@ def stop_all_audio() -> None:
     )
 
 
+
+# --------------------------------------------------------------------------- #
+# Voice recorder component (explicit Start / Stop buttons, records in browser,
+# converts to 16 kHz mono WAV and sends it to Python)
+# --------------------------------------------------------------------------- #
+RECORDER_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<style>
+ html,body{margin:0;padding:0;background:transparent;font-family:Inter,Arial,sans-serif;color:#F8FAFC;}
+ .wrap{display:flex;flex-direction:column;align-items:center;gap:10px;padding:6px 4px 10px 4px;}
+ .row{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;}
+ button{cursor:pointer;border:none;border-radius:999px;padding:14px 26px;font-size:16px;font-weight:600;color:#fff;
+   transition:all .2s ease;min-width:170px;}
+ #start{background:linear-gradient(135deg,#9333EA,#A855F7);box-shadow:0 0 24px rgba(168,85,247,.55);}
+ #start:hover:not(:disabled){box-shadow:0 0 34px rgba(34,211,238,.6);transform:translateY(-1px);}
+ #stop{background:linear-gradient(135deg,#dc2626,#f43f5e);box-shadow:0 0 24px rgba(244,63,94,.45);}
+ button:disabled{opacity:.35;cursor:not-allowed;box-shadow:none;}
+ .status{display:flex;align-items:center;gap:10px;min-height:28px;color:#94A3B8;font-size:14px;text-align:center;}
+ .dot{width:12px;height:12px;border-radius:50%;background:#475569;}
+ .rec .dot{background:#f43f5e;animation:pulse 1s ease-in-out infinite;}
+ .rec .status,.rec{color:#fda4af;}
+ .busy .dot{background:#22D3EE;animation:pulse .6s ease-in-out infinite;}
+ @keyframes pulse{0%,100%{transform:scale(1);opacity:1}50%{transform:scale(1.7);opacity:.35}}
+ .bars{display:none;gap:3px;align-items:center;height:22px;}
+ .rec .bars{display:flex;}
+ .bars i{display:block;width:4px;background:#22D3EE;border-radius:2px;animation:bar 0.9s ease-in-out infinite;}
+ .bars i:nth-child(2){animation-delay:.12s}.bars i:nth-child(3){animation-delay:.24s}
+ .bars i:nth-child(4){animation-delay:.36s}.bars i:nth-child(5){animation-delay:.48s}
+ @keyframes bar{0%,100%{height:5px}50%{height:22px}}
+</style></head><body>
+<div class="wrap" id="wrap">
+  <div class="row">
+    <button id="start">&#127897; Start recording</button>
+    <button id="stop" disabled>&#9632; Stop &amp; send</button>
+  </div>
+  <div class="status"><span class="dot"></span><span class="bars"><i></i><i></i><i></i><i></i><i></i></span>
+    <span id="msg">Press Start, speak, then press Stop &amp; send.</span></div>
+</div>
+<script>
+function post(type,data){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},data||{}),"*");}
+function setH(){post("streamlit:setFrameHeight",{height:document.documentElement.scrollHeight+4});}
+post("streamlit:componentReady",{apiVersion:1});
+const wrap=document.getElementById("wrap"),startB=document.getElementById("start"),
+      stopB=document.getElementById("stop"),msgE=document.getElementById("msg");
+const MAX_SECONDS=120;
+let rec=null,stream=null,chunks=[],tick=null,t0=0;
+function say(t){msgE.textContent=t;setH();}
+function state(s){wrap.className="wrap "+s;startB.disabled=(s!=="");stopB.disabled=(s!=="rec");setH();}
+function errText(e){
+  const n=(e&&e.name)||"";
+  if(n==="NotAllowedError"||n==="SecurityError")return "Microphone permission denied. Click the lock icon in the address bar, allow the microphone, then reload.";
+  if(n==="NotFoundError"||n==="OverconstrainedError")return "No microphone was found. Connect one and try again.";
+  if(n==="NotReadableError")return "The microphone is being used by another app. Close it and try again.";
+  return "Could not start the microphone: "+(e&&e.message?e.message:n);
+}
+startB.onclick=async function(){
+  if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia||!window.MediaRecorder){
+    say("Recording is not supported here. Use Chrome, Edge, Firefox or Safari over HTTPS.");return;}
+  try{stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});}
+  catch(e){say(errText(e));return;}
+  chunks=[];
+  try{rec=new MediaRecorder(stream);}catch(e){say("Recording failed to start: "+e.message);return;}
+  rec.ondataavailable=function(ev){if(ev.data&&ev.data.size)chunks.push(ev.data);};
+  rec.onstop=onStopped;
+  rec.start();t0=Date.now();state("rec");say("Recording… 0s - speak now");
+  tick=setInterval(function(){
+    const s=Math.floor((Date.now()-t0)/1000);say("Recording… "+s+"s - press Stop & send when done");
+    if(s>=MAX_SECONDS&&rec&&rec.state!=="inactive")rec.stop();},500);
+};
+stopB.onclick=function(){if(rec&&rec.state!=="inactive")rec.stop();};
+async function onStopped(){
+  clearInterval(tick);
+  if(stream){stream.getTracks().forEach(function(t){t.stop();});}
+  const secs=(Date.now()-t0)/1000;
+  state("busy");say("Processing your voice…");
+  if(secs<0.6||!chunks.length){state("");say("That was too short. Press Start and speak for a moment.");return;}
+  try{
+    const blob=new Blob(chunks,{type:(rec&&rec.mimeType)||"audio/webm"});
+    const buf=await blob.arrayBuffer();
+    const AC=window.AudioContext||window.webkitAudioContext;
+    const ctx=new AC();
+    const decoded=await new Promise(function(res,rej){ctx.decodeAudioData(buf,res,rej);});
+    try{ctx.close();}catch(e){}
+    const wav=await toWav(decoded);
+    const b64=await toB64(new Blob([wav],{type:"audio/wav"}));
+    post("streamlit:setComponentValue",{value:{id:Date.now()+"-"+Math.random().toString(36).slice(2),
+        mime:"audio/wav",b64:b64,seconds:secs},dataType:"json"});
+    state("busy");say("Sent! The AI is answering…");
+    setTimeout(function(){state("");say("Press Start to ask another question.");},2500);
+  }catch(e){state("");say("Could not process the recording ("+(e&&e.message?e.message:"decode error")+"). Please try again.");}
+}
+async function toWav(audioBuf){
+  const rate=16000,len=Math.max(1,Math.ceil(audioBuf.duration*rate));
+  const off=new OfflineAudioContext(1,len,rate);
+  const src=off.createBufferSource();src.buffer=audioBuf;src.connect(off.destination);src.start(0);
+  const out=(await off.startRendering()).getChannelData(0);
+  const pcm=new DataView(new ArrayBuffer(44+out.length*2));
+  function str(o,s){for(let i=0;i<s.length;i++)pcm.setUint8(o+i,s.charCodeAt(i));}
+  str(0,"RIFF");pcm.setUint32(4,36+out.length*2,true);str(8,"WAVE");str(12,"fmt ");
+  pcm.setUint32(16,16,true);pcm.setUint16(20,1,true);pcm.setUint16(22,1,true);
+  pcm.setUint32(24,rate,true);pcm.setUint32(28,rate*2,true);pcm.setUint16(32,2,true);pcm.setUint16(34,16,true);
+  str(36,"data");pcm.setUint32(40,out.length*2,true);
+  for(let i=0;i<out.length;i++){const v=Math.max(-1,Math.min(1,out[i]));pcm.setInt16(44+i*2,v<0?v*32768:v*32767,true);}
+  return pcm.buffer;
+}
+function toB64(blob){return new Promise(function(res,rej){const r=new FileReader();
+  r.onload=function(){res(String(r.result).split(",")[1]);};r.onerror=rej;r.readAsDataURL(blob);});}
+window.addEventListener("message",function(){setH();});
+setH();
+</script></body></html>"""
+
+
+@st.cache_resource(show_spinner=False)
+def get_recorder():
+    folder = Path(tempfile.gettempdir()) / "abdur_ai_recorder_v1"
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "index.html").write_text(RECORDER_HTML, encoding="utf-8")
+    return components.declare_component("abdur_voice_recorder", path=str(folder))
+
 # --------------------------------------------------------------------------- #
 # State
 # --------------------------------------------------------------------------- #
@@ -277,7 +397,7 @@ def init_state() -> None:
     ss = st.session_state
     ss.setdefault("conversations", {})
     ss.setdefault("page", "🎙️ Voice Assistant")
-    ss.setdefault("mic_n", 0)
+    ss.setdefault("last_rec_id", None)
     ss.setdefault("autoplay_id", None)
     ss.setdefault("flash", None)
     ss.setdefault("api_status", "unknown")
@@ -641,12 +761,13 @@ def page_voice(client) -> None:
 
     speaking = st.session_state.autoplay_id is not None
     orb_ph = st.empty()
-    orb_ph.markdown(orb("speaking", "Speaking…") if speaking else orb("idle", "Tap the mic and start talking"),
+    orb_ph.markdown(orb("speaking", "Speaking…") if speaking else orb("idle", "Press Start recording and talk"),
                     unsafe_allow_html=True)
 
-    audio = st.audio_input("Record your question", key=f"mic_{st.session_state.mic_n}")
-    st.markdown('<div class="mic-hint">Tap to record · tap again to stop · I answer automatically. '
-                "If nothing records, allow microphone access in your browser's address bar.</div>",
+    recorder = get_recorder()
+    rec_value = recorder(key="voice_rec", default=None)
+    st.markdown('<div class="mic-hint">Press <b>Start recording</b>, speak, then press <b>Stop &amp; send</b>. '
+                "I answer out loud automatically. Your browser will ask for microphone permission the first time.</div>",
                 unsafe_allow_html=True)
 
     c1, c2, _ = st.columns([1, 1, 3])
@@ -656,16 +777,19 @@ def page_voice(client) -> None:
         new_conversation()
         st.rerun()
 
-    if audio is not None:
-        data = audio.getvalue()
-        st.session_state.mic_n += 1  # resets the recorder after this run
+    if isinstance(rec_value, dict) and rec_value.get("id") and rec_value["id"] != st.session_state.last_rec_id:
+        st.session_state.last_rec_id = rec_value["id"]
+        try:
+            data = base64.b64decode(rec_value.get("b64", ""))
+        except Exception:
+            data = b""
         if len(data) < 3000:
             st.session_state.flash = ("warning", "I did not hear anything. Please record again and speak for a moment.")
             st.rerun()
         orb_ph.markdown(orb("thinking", "Listening to your words…"), unsafe_allow_html=True)
         try:
             st.session_state.stats["requests"] += 1
-            result = voice_turn(client, data, audio.type or "audio/wav", conv)
+            result = voice_turn(client, data, "audio/wav", conv)
             if not result["transcript"]:
                 st.session_state.flash = ("warning", "I could not understand the recording. Please try again, a little closer to the microphone.")
                 st.rerun()
